@@ -192,40 +192,98 @@ class NumericalResponseValidator(ResponseValidatorABC):
     ]
 
     def fix(self, response, verbose=False):
-        """
-        Fix common issues in numerical responses.
-
-        This method attempts to extract valid numbers from text responses,
-        handle formatting issues, and ensure the response contains a valid number.
+        """Repair a numerical answer only when its value is unambiguous.
 
         Args:
             response: The response dictionary to fix.
             verbose: If True, print information about the fixing process.
 
         Returns:
-            A fixed version of the response dictionary.
+            A validated repair, or the unchanged response if repair is unsafe.
 
         Notes:
-            - Attempts to extract numbers using regex pattern matching
-            - Removes commas from numbers (e.g., "1,000" → "1000")
-            - Preserves any comment in the original response
+            Prefer a valid structured answer, then an explicit final-answer
+            marker or a final standalone numeric line. Otherwise require a
+            single numeric candidate. Only use generated_tokens when answer
+            is missing or None; never extract an answer from comments.
+            Preserve response metadata and leave the input untouched, so the
+            original_exception recorded by validate retains repair provenance.
         """
-        response_text = str(response).lower()
+        try:
+            self._base_validate(response)
+            return response
+        except QuestionAnswerValidationError:
+            pass
+
+        response_text = response.get("answer")
+        if response_text is None:
+            response_text = response.get("generated_tokens")
+        if not isinstance(response_text, str):
+            return response
 
         if verbose:
-            print(f"Invalid generated tokens was: {response_text}")
+            print(f"Invalid numerical answer was: {response_text}")
 
-        pattern = r"\b\d+(?:\.\d+)?\b"
-        match = re.search(pattern, response_text.replace(",", ""))
-        solution = match.group(0) if match else response.get("answer")
+        solution = self._extract_number(response_text)
+        if solution is None:
+            return response
+
+        fixed_response = {**response, "answer": solution.replace(",", "")}
+        try:
+            self._base_validate(fixed_response)
+        except QuestionAnswerValidationError:
+            return response
 
         if verbose:
             print("Proposed solution is: ", solution)
 
-        if "comment" in response:
-            return {"answer": solution, "comment": response["comment"]}
-        else:
-            return {"answer": solution}
+        return fixed_response
+
+    @staticmethod
+    def _extract_number(text: str) -> Optional[str]:
+        """Select one complete numeric literal without guessing among candidates."""
+        number = (
+            r"[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+            r"(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+        )
+        text = text.strip()
+        final_markers = list(
+            re.finditer(
+                r"\bfinal\s+(?:answer|result|value|probability)\s*(?::|=|\bis\b)\s*",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if final_markers:
+            if len(final_markers) != 1:
+                return None
+            candidate = text[final_markers[0].end() :].strip().removesuffix(".")
+            return candidate if re.fullmatch(number, candidate) else None
+
+        last_line = text.splitlines()[-1] if text else ""
+        if re.fullmatch(number, last_line.strip()):
+            return last_line.strip()
+
+        # Keep malformed comma groups intact so they cannot become a valid prefix.
+        candidates = list(
+            re.finditer(
+                r"(?<![\w.,+/\u2212-])[+-]?(?:[0-9][0-9,]*(?:\.[0-9]+)?|\.[0-9]+)"
+                r"(?:[eE][+-]?[0-9]+)?(?![\w,+%/-]|\.(?!\s|$))",
+                text,
+            )
+        )
+        if len(candidates) != 1:
+            return None
+        match = candidates[0]
+        remainder = text[: match.start()] + text[match.end() :]
+        # Do not discard other digits, arithmetic signs, or percent markers.
+        if re.search(
+            r"[\d+*/%\u066a\u2010-\u2015\u2212\ufe62\ufe63\uff0b\uff0d\uff05-]",
+            remainder,
+        ):
+            return None
+        candidate = match.group()
+        return candidate if re.fullmatch(number, candidate) else None
 
     def _check_constraints(self, pydantic_edsl_answer: BaseModel):
         """Method preserved for compatibility, constraints handled in Pydantic model."""
